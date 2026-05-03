@@ -11,9 +11,7 @@
  * giving us way more range before additive blending will overflow.
  * 
  * In a post processing step the 32bit render buffer is converted back to
- * 16bit, either using the RSP or CPU. This step takes about 4ms on the RSP. 
- * Doing this on the CPU takes about 70ms, which is obviously unusable. The 
- * CPU code is only here to illustrate what the RSP is doing.
+ * 16bit, either using the RSP or CPU. This step takes about 4ms on the RSP.
  * 
  * Note that the RSP code (rsp_add.rspl) is written in RSPL and transpiled 
  * into assembly (rsp_add.S) using the transpiler from HailToDogongo's 
@@ -59,17 +57,6 @@ void rsp_rgba_8888_to_5551(uint32_t *rgba32_in, uint16_t *rgba16_out) {
 	);
 }
 
-// Convert 32bit rgba 8888 to 16bit 5551 on the CPU
-void cpu_rgba_8888_to_5551(uint32_t *rgba32_in, uint16_t *rgba16_out) {
-	for (int i = 0; i < 320 * 240; i++) {
-		color_t c = color_from_packed32(rgba32_in[i]);
-		if (c.r > 31) { c.r = 31; }
-		if (c.g > 31) { c.g = 31; }
-		if (c.b > 31) { c.b = 31; }
-		rgba16_out[i] = (c.r << 11) | (c.g << 6) | (c.b << 1) | 0x1;
-	}
-}
-
 int main() {
 	debug_init_isviewer();
 	debug_init_usblog();
@@ -91,11 +78,6 @@ int main() {
 	// Init the rendering surface as 32bit
 	surface_t render32 = surface_alloc(FMT_RGBA32, display_width, display_height);
 
-
-	rdpq_font_t *font = rdpq_font_load("rom:/encode.font64");
-	enum { MYFONT = 1 };
-	rdpq_text_register_font(MYFONT, font);
-
 	// Initialize flares with random positions and velocity
 	int flare_width = 64;
 	int flare_height = 64;
@@ -109,37 +91,19 @@ int main() {
 		flare->vy = (float)rand() / RAND_MAX - 0.5f;
 	}
 
-	enum {
-		MODE_16B_NATIVE,
-		MODE_32B_CPU,
-		MODE_32B_RSP,
-		MODE_MAX
-	} mode = MODE_32B_RSP;
-
-	uint32_t frame_time = 0;
-
 	while (true) {
 		surface_t *screen = display_get();
-
-		uint32_t time_frame_start = TICKS_READ();
 
 		rdpq_attach(screen, NULL);
 		rdpq_set_mode_standard();
 
-		if (mode == MODE_16B_NATIVE) {
-			// Draw directly onto the 16bit frame buffer surface using the naive
-			// additive blend mode. This will cause overflow!
-			rdpq_mode_blender(RDPQ_BLENDER_ADDITIVE);
-		}
-		else {
-			// Draw onto the separate 32bit render surface using a color combiner 
-			// that blend additively with the target surface but also multiplies
-			// each incoming pixel with 32/256 (i.e. divide by 8) to convert 
-			// 8 bit colors into 5 bit.
-			rdpq_set_fog_color(RGBA32(0, 0, 0, 32));
-			rdpq_mode_blender(RDPQ_BLENDER((IN_RGB, FOG_ALPHA, MEMORY_RGB, ONE)));	
-			rdpq_set_color_image(&render32);
-		}
+		// Draw onto the separate 32bit render surface using a color combiner 
+		// that blend additively with the target surface but also multiplies
+		// each incoming pixel with 32/256 (i.e. divide by 8) to convert 
+		// 8 bit colors into 5 bit.
+		rdpq_set_fog_color(RGBA32(0, 0, 0, 32));
+		rdpq_mode_blender(RDPQ_BLENDER((IN_RGB, FOG_ALPHA, MEMORY_RGB, ONE)));	
+		rdpq_set_color_image(&render32);
 
 		rdpq_clear((color_t){0,0,0,0});
 		
@@ -168,57 +132,11 @@ int main() {
 			});
 		}	
 		
-		if (mode == MODE_16B_NATIVE) {
-			rdpq_text_printf(
-				NULL, MYFONT, 32, 32, 
-				"Native 16bit with overflow\n"
-				"Total: %.2f ms", 
-				frame_time * (1000.0 / TICKS_PER_SECOND)
-			);
-			rdpq_detach();
-		}
-		else {
-			rdpq_detach();
 
-			rspq_wait(); // <- only needed to meassure convert time
-			uint32_t time_convert_start = TICKS_READ();
-
-			// Convert the 32bit render surface to the 16bit screen buffer surface
-			if (mode == MODE_32B_CPU) {
-				rspq_wait();
-				cpu_rgba_8888_to_5551(render32.buffer, screen->buffer);
-			}
-			else if (mode == MODE_32B_RSP) {
-				rdpq_fence();
-				rsp_rgba_8888_to_5551(render32.buffer, screen->buffer);
-			}
-			
-			rspq_wait(); // <- only needed to meassure convert time
-			uint32_t convert_time = TICKS_READ() - time_convert_start;
- 
-			rdpq_set_color_image(screen);
-			rdpq_text_printf(
-				NULL, MYFONT, 32, 32,
-				"Convert 32bit to 16bit on %s\n"
-				"Convert: %.2f ms\n"
-				"Total: %.2f ms", 
-				mode == MODE_32B_CPU ? "CPU" : "RSP",
-				convert_time * (1000.0 / TICKS_PER_SECOND),
-				frame_time * (1000.0 / TICKS_PER_SECOND)				
-			);
-		}
+		rdpq_detach();
+		rdpq_fence();
+		rsp_rgba_8888_to_5551(render32.buffer, screen->buffer);
 
 		display_show(screen);
-
-		rspq_wait(); // <- only needed to meassure frame time
-		frame_time = TICKS_READ() - time_frame_start;	
-
-		// Cycle render modes on A button press
-		joypad_poll();
-		joypad_buttons_t jp = joypad_get_buttons_pressed(JOYPAD_PORT_1);
-
-		if (jp.a) {
-			mode = (mode + 1) % MODE_MAX;
-		}
 	}
 }
