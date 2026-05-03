@@ -1,0 +1,134 @@
+include "rsp_queue.inc"
+
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 240
+#define SCREEN_STRIDE_RGBA32 (SCREEN_WIDTH * 4)
+#define SCREEN_STRIDE_RGBA16 (SCREEN_WIDTH * 2)
+#define LINES_PER_BATCH 2
+#define SCREEN_WIDTH_BATCH 640
+#define BATCH_SIZE_RGBA32 (SCREEN_STRIDE_RGBA32 * LINES_PER_BATCH)
+#define BATCH_SIZE_RGBA16 (SCREEN_STRIDE_RGBA16 * LINES_PER_BATCH)
+
+bss {
+	vec16 BUFF_IN[160];
+	u16 BUFF_OUT[SCREEN_WIDTH];
+}
+
+// DMA from RDRAM into DMEM
+macro dmaInAsync(u32 addrRDRAM, u32 addrDMEM, u32 size)
+{
+	@Barrier("DMA") set_dma_addr_rsp(addrDMEM);
+	@Barrier("DMA") set_dma_addr_rdram(addrRDRAM);
+	@Barrier("DMA") set_dma_read(size);
+}
+
+// DMA from DMEM into RDRAM
+macro dmaOutAsync(u32 addrRDRAM, u32 addrDMEM, u32 size)
+{
+	@Barrier("DMA") set_dma_addr_rsp(addrDMEM);
+	@Barrier("DMA") set_dma_addr_rdram(addrRDRAM);
+	@Barrier("DMA") set_dma_write(size);
+}
+
+ macro dmaAwait()
+ {
+	loop {
+		RA = get_dma_busy();
+		// DELAY SLOT
+	} while(RA != 0)
+ }
+
+
+macro convert_8px(
+	vec16 px_out,
+	u32 dmem_in,
+	vec16 px_r, vec16 px_g, vec16 px_b
+) {
+	asm_op("lfv", px_r, 0,	0, dmem_in);
+	asm_op("lfv", px_r, 8, 16, dmem_in);
+	dmem_in += 1;
+
+	asm_op("lfv", px_g, 0,	0, dmem_in);
+	asm_op("lfv", px_g, 8, 16, dmem_in);
+	dmem_in += 1;
+
+	asm_op("lfv", px_b, 0,	0, dmem_in);
+	asm_op("lfv", px_b, 8, 16, dmem_in);
+	dmem_in += 32 - 2;
+
+	px_r:sint *= (1 << (8 - 5)); // saturated "shift" from 5 to 8bit
+	px_g:sint *= (1 << (8 - 5));
+	px_b:sint *= (1 << (8 - 5));
+
+	// remove all bits not belonging to the color
+	// blue can be ignored since it just flows into the unused alpha-channel	
+	px_g &= VCONST_RGB.x;
+	px_r &= VCONST_RGB.x;
+
+	px_out =	px_r:uint * 2;
+	asm_op("vmadl", px_out, px_g, VSHIFT8.w);
+	asm_op("vmadl", px_out, px_b, VSHIFT.x);
+}
+
+command<0> RGBA8888_TO_5551(u32 ptr_in, u32 ptr_out) {
+
+	u32 ptr_in_end = ptr_in + (SCREEN_STRIDE_RGBA32 * SCREEN_HEIGHT);
+
+	vec16 VCONST_RGB; // mask to only keep 5 bits from a fraction, used for RGBA16 conversion
+	VCONST_RGB.x = 0b0'11111'00000'00000;
+
+	u32 dmem_out_start = BUFF_OUT;
+	u32 dma_size_in = BATCH_SIZE_RGBA32 - 1;
+	u32 dma_size_out = SCREEN_STRIDE_RGBA16 - 1;
+
+	dmaAwait();
+
+	loop {
+		u32 dmem_in = BUFF_IN;
+		dmaInAsync(ptr_in, dmem_in, dma_size_in);
+
+		ptr_in += BATCH_SIZE_RGBA32;
+		u32 dmem_in_batch_end = dmem_in + BATCH_SIZE_RGBA32;
+
+		loop {
+			u32 dmem_in_end, dmem_out;
+
+		// DMA await:
+		loop {
+			RA = get_dma_busy();
+			// fill up stalls from reading busy state:
+			dmem_in_end = dmem_in + SCREEN_STRIDE_RGBA32;
+			dmem_out = dmem_out_start;
+		} while(RA != 0)
+
+		vec16 px_r0, px_g0, px_b0;
+		vec16 px_r1, px_g1, px_b1;
+		vec16 px_r2, px_g2, px_b2;
+		vec16 px_r3, px_g3, px_b3;
+		vec16 px_r4, px_g4, px_b4;
+		vec16 px_out0, px_out1, px_out2, px_out3, px_out4;
+
+	 	// unroll loop to avoid stalls (80 output bytes at once, so 16 iterations)
+		loop {
+			px_out0 = convert_8px(dmem_in,	px_r0, px_g0, px_b0);
+			px_out1 = convert_8px(dmem_in,	px_r1, px_g1, px_b1);
+			px_out2 = convert_8px(dmem_in,	px_r2, px_g2, px_b2);
+			px_out3 = convert_8px(dmem_in,	px_r3, px_g3, px_b3);
+			px_out4 = convert_8px(dmem_in,	px_r4, px_g4, px_b4);
+
+			store(px_out0, dmem_out, 0);
+			store(px_out1, dmem_out, 16);
+			store(px_out2, dmem_out, 32);
+			store(px_out3, dmem_out, 48);
+			store(px_out4, dmem_out, 64);
+
+			dmem_out += 80;
+		} while(dmem_in != dmem_in_end)
+		
+		dmaOutAsync(ptr_out, dmem_out_start, dma_size_out);
+		ptr_out += SCREEN_STRIDE_RGBA16;
+			
+		} while(dmem_in != dmem_in_batch_end)
+	} while(ptr_in != ptr_in_end)
+	dmaAwait();
+}
